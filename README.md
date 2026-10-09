@@ -11,8 +11,8 @@
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-export ENTSOE_TOKEN=<токен ENTSO-E>   # необязательно: без него XML ENTSO-E разбирается на примере структуры
+export ENTSOE_TOKEN=<токен ENTSO-E>   # нужен только для раздела ENTSO-E
 jupyter notebook 02_sources_study.ipynb
 ```
 
-Все загрузки кэшируются в `data/raw/` (каталог не хранится в git). Первый полный запуск скачивает около 300 МБ, основная часть — база OPSD SQLite (226 МБ).
+База OPSD (SQLite, 226 МБ) скачивается при первом запуске в `data/` — каталог не хранится в git. Остальные данные загружаются по API за 2024 год.
