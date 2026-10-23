@@ -5,14 +5,21 @@
 | Файл | Этап CRISP-DM |
 |:--|:--|
 | `02_sources_study.ipynb` | 2.2 — подбор и изучение источников, аналитический портрет |
+| `03_data_preparation.ipynb` | 2.3 — предварительный анализ, очистка, тексты, слияние, хранение |
+| `etl.py` | 2.3 — скрипт загрузки, очистки, слияния и обновления базы |
 
 ## Запуск
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-export ENTSOE_TOKEN=<токен ENTSO-E>   # нужен только для раздела ENTSO-E
-jupyter notebook 02_sources_study.ipynb
+jupyter notebook
 ```
 
-База OPSD (SQLite, 226 МБ) скачивается при первом запуске в `data/` — каталог не хранится в git. Остальные данные загружаются по API за 2024 год.
+Данные складываются в `data/` (каталог не хранится в git): база OPSD `opsd.sqlite` (226 МБ, скачивается ноутбуком 02), новости `news/`, итоговая база `energy.db`.
+
+Обновление базы за новый период:
+
+```bash
+python etl.py 2026-01-01 2026-10-21
+```
