@@ -8,6 +8,7 @@
 import sqlite3
 import sys
 import time
+import urllib.request
 import xml.etree.ElementTree as ET
 from io import StringIO
 from pathlib import Path
@@ -16,6 +17,7 @@ import pandas as pd
 import requests
 
 DB = 'data/energy.db'
+# 5 крупнейших центров потребления Германии: город → (широта, долгота)
 CITIES = {'Berlin': (52.52, 13.41), 'Hamburg': (53.55, 9.99), 'Munich': (48.14, 11.58),
           'Frankfurt': (50.11, 8.68), 'Cologne': (50.94, 6.96)}
 
@@ -63,7 +65,7 @@ def load_weather(start, end):
 
 
 def load_holidays(start, end):
-    """Праздники Германии."""
+    """Праздники Германии; global = True — праздник во всей стране."""
     frames = []
     for year in range(int(start[:4]), int(end[:4]) + 1):
         frames.append(pd.DataFrame(get(f'https://date.nager.at/api/v3/PublicHolidays/{year}/DE').json()))
@@ -76,6 +78,7 @@ def load_eurostat(start, end):
     xml = get(url, {'startPeriod': start[:7], 'endPeriod': end[:7]}).text
     fuels = {'TOTAL': 'total', 'CF': 'fossil', 'RA100': 'hydro', 'RA300': 'wind', 'RA400': 'solar'}
     rows = []
+    # Series — ряд одного вида топлива, Obs — его значения по месяцам
     for series in ET.fromstring(xml).findall('.//{*}Series'):
         key = {v.get('id'): v.get('value') for v in series.findall('{*}SeriesKey/{*}Value')}
         for obs in series.findall('{*}Obs'):
@@ -92,6 +95,7 @@ def load_news(start, end):
                'gaspreis': 'Gaspreis Strompreis'}
     frames = []
     for name, query in queries.items():
+        # Google отдаёт не больше 100 статей на запрос, поэтому спрашиваем по месяцу
         for month in pd.date_range(start, end, freq='MS'):
             path = Path(f'data/news/{name}/{month:%Y-%m}.xml')
             if not path.exists():
@@ -100,7 +104,7 @@ def load_news(start, end):
                 r = get('https://news.google.com/rss/search', {'q': q, 'hl': 'de', 'gl': 'DE', 'ceid': 'DE:de'})
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(r.text)
-                time.sleep(1)
+                time.sleep(1)  # пауза, чтобы Google не заблокировал
             text = path.read_text()
             if '<item>' in text:  # в некоторых месяцах по запросу ничего нет
                 frames.append(pd.read_xml(StringIO(text), xpath='//item')[['title', 'source', 'pubDate', 'link']])
@@ -109,6 +113,10 @@ def load_news(start, end):
 
 def load_opsd():
     """Цена и потребление DE-LU из базы OPSD (SQLite), 10.2018 – 09.2020 — для сверки."""
+    if not Path('data/opsd.sqlite').exists():  # база скачивается один раз (226 МБ)
+        Path('data').mkdir(exist_ok=True)
+        urllib.request.urlretrieve('https://data.open-power-system-data.org/time_series/2020-10-06/time_series.sqlite',
+                                   'data/opsd.sqlite')
     con = sqlite3.connect('data/opsd.sqlite')
     opsd = pd.read_sql('''
         SELECT utc_timestamp AS time, DE_LU_price_day_ahead AS price,
@@ -137,16 +145,16 @@ def clean_price(price):
 
 
 def clean_power(power):
-    power = power.resample('h').mean()                  # 15 минут → час
-    if 'Nuclear' not in power:                          # после 2023 г. ряда может не быть совсем
-        power['Nuclear'] = 0
-    power = power[list(POWER_COLUMNS)].rename(columns=POWER_COLUMNS)
-    power['nuclear'] = power['nuclear'].fillna(0)       # АЭС закрыты 15.04.2023
+    power = power.resample('h').mean()  # 15 минут → час
+    # reindex создаёт пустым столбец, которого нет в выгрузке: после закрытия АЭС ряда Nuclear может не быть
+    power = power.reindex(columns=list(POWER_COLUMNS)).rename(columns=POWER_COLUMNS)
+    power['nuclear'] = power['nuclear'].fillna(0)  # АЭС закрыты 15.04.2023 — выработка 0 МВт
     return power
 
 
 def clean_weather(weather):
-    """Погода по зоне: среднее по 5 городам, код погоды — максимальный (самое выраженное явление)."""
+    """Погода по зоне: среднее по 5 городам.
+    Код погоды — категория, его нельзя усреднять; берём максимальный — самую плохую погоду из 5 городов."""
     zone = weather.drop(columns='city').groupby('time').mean()
     zone['weather_code'] = weather.groupby('time')['weather_code'].max()
     return zone
@@ -186,7 +194,7 @@ def signal_of(title):
 def annotate_news(news):
     news = news.copy()
     news['title'] = news['title'].str.rsplit(' - ', n=1).str[0]   # убираем « - Издание» в конце
-    news = news.drop_duplicates(['title', 'source'])
+    news = news.drop_duplicates(['title', 'source'])               # статья могла найтись по разным запросам
     lower = news['title'].str.lower()
     news = news[lower.str.contains('strom|energie|gas|preis')]    # только релевантные заголовки
     news['topic'] = news['title'].str.lower().apply(topic_of)
@@ -199,38 +207,25 @@ def annotate_news(news):
 # ---------- Слияние ----------
 
 def build_dataset(price, power, weather, holidays, eurostat, news):
-    df = price.to_frame().join(power).join(weather)   # почасовые данные; остаются часы, где есть цена
+    df = price.to_frame().join(power).join(weather)  # почасовые данные; остаются часы, где есть цена
 
-    local = df.index.tz_convert('Europe/Berlin')      # календарь — по местному времени
+    # ключи для дневных и месячных источников — по берлинскому времени
+    local = df.index.tz_convert('Europe/Berlin')
     df['date'] = local.strftime('%Y-%m-%d')
-    df['hour'] = local.hour
-    df['dow'] = local.dayofweek
-    df['month'] = local.month
-    df['year'] = local.year
+    df['month'] = local.strftime('%Y-%m')
 
     # праздники: день → все часы дня
     federal = holidays.loc[holidays['global'], 'date']
     df['is_holiday'] = df['date'].isin(federal)
-    df['day_type'] = 'рабочий'
-    df.loc[df['dow'] >= 5, 'day_type'] = 'выходной'
-    df.loc[df['is_holiday'], 'day_type'] = 'праздник'
 
-    # Eurostat: месяц → все часы месяца
-    month = pd.Series(local.strftime('%Y-%m'), index=df.index)
-    df['eu_res_share'] = month.map((eurostat['wind'] + eurostat['solar'] + eurostat['hydro']) / eurostat['total'])
+    # Eurostat: доля ВИЭ за месяц → все часы месяца
+    res_share = (eurostat['wind'] + eurostat['solar'] + eurostat['hydro']) / eurostat['total']
+    df['eu_res_share'] = df['month'].map(res_share)
 
-    # новости: день → все часы дня; дни без новостей — 0
+    # новости: число и средний сигнал за день → все часы дня; дни без новостей — 0
     daily = news.groupby('date').agg(news_count=('title', 'count'), news_signal=('price_signal', 'mean'))
     df = df.join(daily, on='date')
     df[['news_count', 'news_signal']] = df[['news_count', 'news_signal']].fillna(0)
-
-    # целевой признак: час из 25% самых дешёвых за сутки
-    df['is_cheap_window'] = df['price'] <= df.groupby('date')['price'].transform('quantile', 0.25)
-
-    # режим рынка: уровень цен сильно отличался до, во время и после энергокризиса
-    df['market_regime'] = 'после кризиса'
-    df.loc[df['year'] <= 2022, 'market_regime'] = 'кризис 2021–22'
-    df.loc[df['year'] <= 2020, 'market_regime'] = 'до кризиса'
 
     df.index.name = 'time'
     return df.reset_index()
@@ -242,7 +237,7 @@ def save(df, table, start, end):
     """Записывает данные в таблицу; старые строки за этот же период удаляются,
     поэтому повторный запуск не создаёт дублей."""
     con = sqlite3.connect(DB)
-    if con.execute('SELECT 1 FROM sqlite_master WHERE name = ?', (table,)).fetchone():
+    if con.execute('SELECT 1 FROM sqlite_master WHERE name = ?', (table,)).fetchone():  # таблица уже есть
         con.execute(f'DELETE FROM {table} WHERE date BETWEEN ? AND ?', (start, end))
     df.to_sql(table, con, if_exists='append', index=False)
     con.commit()
