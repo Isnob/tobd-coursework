@@ -1,7 +1,7 @@
-"""Этап 2.3: загрузка, очистка, аннотирование, слияние и сохранение данных.
+"""Этап 2.3: загрузка, очистка, разметка новостей, слияние и сохранение данных.
 
 Функции используются в ноутбуке 03_data_preparation.ipynb.
-Тот же файл — скрипт обновления базы за новый период:
+Этот же файл — скрипт обновления базы за новый период:
 
     python etl.py 2026-01-01 2026-10-21
 """
@@ -12,57 +12,49 @@ import xml.etree.ElementTree as ET
 from io import StringIO
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import requests
 
-DB = Path('data/energy.db')
-NEWS_CACHE = Path('data/news')
-TZ = 'Europe/Berlin'
+DB = 'data/energy.db'
 CITIES = {'Berlin': (52.52, 13.41), 'Hamburg': (53.55, 9.99), 'Munich': (48.14, 11.58),
           'Frankfurt': (50.11, 8.68), 'Cologne': (50.94, 6.96)}
-NEWS_QUERIES = {'strompreis': 'Strompreis', 'negative_preise': '"negative Strompreise"',
-                'gaspreis': 'Gaspreis Strompreis'}
 
 
-def fetch(url, params=None):
-    """GET-запрос; при обрыве соединения или ответе 429 (слишком много запросов) ждёт и повторяет."""
-    for attempt in range(4):
+def get(url, params=None):
+    """Загружает страницу; если сеть оборвалась — ждёт и пробует ещё раз."""
+    for attempt in range(3):
         try:
             r = requests.get(url, params=params, headers={'User-Agent': 'Mozilla/5.0'}, timeout=300)
-            if r.status_code != 429:
-                break
-        except requests.ConnectionError:
-            if attempt == 3:
-                raise
-        time.sleep(30)
-    r.raise_for_status()
-    return r
+            r.raise_for_status()
+            return r
+        except requests.RequestException:
+            time.sleep(30)
+    raise RuntimeError(f'Не удалось загрузить {url}')
 
 
 # ---------- Загрузка ----------
 
 def load_price(start, end):
     """Цена рынка на сутки вперёд, зона DE-LU, EUR/МВт·ч."""
-    d = fetch('https://api.energy-charts.info/price', {'bzn': 'DE-LU', 'start': start, 'end': end}).json()
+    d = get('https://api.energy-charts.info/price', {'bzn': 'DE-LU', 'start': start, 'end': end}).json()
     return pd.Series(d['price'], index=pd.to_datetime(d['unix_seconds'], unit='s', utc=True), name='price')
 
 
 def load_power(start, end):
-    """Генерация по типам станций и нагрузка в Германии, МВт."""
-    d = fetch('https://api.energy-charts.info/public_power', {'country': 'de', 'start': start, 'end': end}).json()
-    return pd.DataFrame({t['name']: t['data'] for t in d['production_types']},
-                        index=pd.to_datetime(d['unix_seconds'], unit='s', utc=True)).astype(float)
+    """Генерация по типам станций и потребление в Германии, МВт."""
+    d = get('https://api.energy-charts.info/public_power', {'country': 'de', 'start': start, 'end': end}).json()
+    data = {t['name']: t['data'] for t in d['production_types']}
+    return pd.DataFrame(data, index=pd.to_datetime(d['unix_seconds'], unit='s', utc=True)).astype(float)
 
 
 def load_weather(start, end):
     """Почасовая погода в 5 крупнейших городах Германии."""
     # берём на день раньше: сутки по Берлину начинаются в 23:00 UTC предыдущего дня
-    day_before = (pd.Timestamp(start) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    day_before = str(pd.Timestamp(start).date() - pd.Timedelta(days=1))
     frames = []
     for city, (lat, lon) in CITIES.items():
-        d = fetch('https://archive-api.open-meteo.com/v1/archive', {
-            'latitude': lat, 'longitude': lon, 'start_date': day_before, 'end_date': end, 'timezone': 'UTC',
+        d = get('https://archive-api.open-meteo.com/v1/archive', {
+            'latitude': lat, 'longitude': lon, 'start_date': day_before, 'end_date': end,
             'hourly': 'temperature_2m,wind_speed_100m,shortwave_radiation,cloud_cover,weather_code'}).json()
         frames.append(pd.DataFrame(d['hourly']).assign(city=city))
     weather = pd.concat(frames, ignore_index=True)
@@ -71,21 +63,18 @@ def load_weather(start, end):
 
 
 def load_holidays(start, end):
-    """Праздники Германии: федеральные и региональные."""
-    years = range(int(start[:4]), int(end[:4]) + 1)
-    hol = pd.concat([pd.DataFrame(fetch(f'https://date.nager.at/api/v3/PublicHolidays/{y}/DE').json())
-                     for y in years], ignore_index=True)
-    hol['date'] = pd.to_datetime(hol['date'])
-    hol['n_states'] = np.where(hol['global'], 16, hol['counties'].str.len())  # в скольких землях выходной
-    return hol[['date', 'localName', 'global', 'n_states']]
+    """Праздники Германии."""
+    frames = []
+    for year in range(int(start[:4]), int(end[:4]) + 1):
+        frames.append(pd.DataFrame(get(f'https://date.nager.at/api/v3/PublicHolidays/{year}/DE').json()))
+    return pd.concat(frames, ignore_index=True)[['date', 'localName', 'global']]
 
 
 def load_eurostat(start, end):
-    """Помесячное производство электроэнергии в Германии по видам топлива, ГВт·ч (XML SDMX)."""
+    """Помесячное производство электроэнергии в Германии по видам топлива, ГВт·ч (XML)."""
+    url = 'https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/nrg_cb_pem/M.TOTAL+CF+RA100+RA300+RA400.GWH.DE'
+    xml = get(url, {'startPeriod': start[:7], 'endPeriod': end[:7]}).text
     fuels = {'TOTAL': 'total', 'CF': 'fossil', 'RA100': 'hydro', 'RA300': 'wind', 'RA400': 'solar'}
-    xml = fetch('https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/nrg_cb_pem/'
-                'M.TOTAL+CF+RA100+RA300+RA400.GWH.DE',
-                {'startPeriod': start[:7], 'endPeriod': end[:7]}).text
     rows = []
     for series in ET.fromstring(xml).findall('.//{*}Series'):
         key = {v.get('id'): v.get('value') for v in series.findall('{*}SeriesKey/{*}Value')}
@@ -97,27 +86,29 @@ def load_eurostat(start, end):
 
 
 def load_news(start, end):
-    """Заголовки новостей Google News помесячно по трём запросам.
-    Ответы сохраняются в data/news, чтобы не запрашивать их повторно."""
-    rows = []
-    for key, query in NEWS_QUERIES.items():
+    """Заголовки Google News помесячно по трём запросам.
+    Каждый ответ сохраняется в data/news, чтобы при повторном запуске не скачивать заново."""
+    queries = {'strompreis': 'Strompreis', 'negative_preise': '"negative Strompreise"',
+               'gaspreis': 'Gaspreis Strompreis'}
+    frames = []
+    for name, query in queries.items():
         for month in pd.date_range(start, end, freq='MS'):
-            path = NEWS_CACHE / key / f'{month:%Y-%m}.xml'
+            path = Path(f'data/news/{name}/{month:%Y-%m}.xml')
             if not path.exists():
-                period = f'after:{month:%Y-%m-%d} before:{month + pd.offsets.MonthBegin():%Y-%m-%d}'
-                r = fetch('https://news.google.com/rss/search',
-                          {'q': f'{query} {period}', 'hl': 'de', 'gl': 'DE', 'ceid': 'DE:de'})
+                next_month = month + pd.offsets.MonthBegin()
+                q = f'{query} after:{month:%Y-%m-%d} before:{next_month:%Y-%m-%d}'
+                r = get('https://news.google.com/rss/search', {'q': q, 'hl': 'de', 'gl': 'DE', 'ceid': 'DE:de'})
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(r.text)
                 time.sleep(1)
-            if '<item>' in path.read_text():  # в некоторых месяцах по запросу ничего нет
-                items = pd.read_xml(StringIO(path.read_text()), xpath='//item')
-                rows.append(items[['title', 'source', 'pubDate', 'link']].assign(query=key))
-    return pd.concat(rows, ignore_index=True)
+            text = path.read_text()
+            if '<item>' in text:  # в некоторых месяцах по запросу ничего нет
+                frames.append(pd.read_xml(StringIO(text), xpath='//item')[['title', 'source', 'pubDate', 'link']])
+    return pd.concat(frames, ignore_index=True)
 
 
 def load_opsd():
-    """Цена и нагрузка DE-LU из базы OPSD (SQLite), 10.2018 – 09.2020 — для сверки."""
+    """Цена и потребление DE-LU из базы OPSD (SQLite), 10.2018 – 09.2020 — для сверки."""
     con = sqlite3.connect('data/opsd.sqlite')
     opsd = pd.read_sql('''
         SELECT utc_timestamp AS time, DE_LU_price_day_ahead AS price,
@@ -125,12 +116,13 @@ def load_opsd():
         FROM time_series_60min_singleindex
         WHERE DE_LU_price_day_ahead IS NOT NULL''', con)
     con.close()
-    return opsd.set_index(pd.to_datetime(opsd.pop('time'), utc=True))
+    opsd['time'] = pd.to_datetime(opsd['time'], utc=True)
+    return opsd.set_index('time')
 
 
 # ---------- Очистка ----------
 
-POWER_COLUMNS = {
+POWER_COLUMNS = {  # нужные ряды генерации и их короткие имена
     'Load': 'load', 'Residual load': 'residual_load', 'Renewable share of load': 'res_share',
     'Solar': 'solar', 'Wind onshore': 'wind_onshore', 'Wind offshore': 'wind_offshore',
     'Fossil gas': 'gas', 'Fossil brown coal / lignite': 'lignite', 'Fossil hard coal': 'hard_coal',
@@ -145,134 +137,133 @@ def clean_price(price):
 
 
 def clean_power(power):
-    # reindex: если ряда нет в выгрузке (например, Nuclear в 2026 г.), столбец будет пустым, а не ошибкой
-    power = power.resample('h').mean().reindex(columns=list(POWER_COLUMNS)).rename(columns=POWER_COLUMNS)
-    power['nuclear'] = power['nuclear'].fillna(0)  # АЭС закрыты 15.04.2023, после этого ряд не публикуется
+    power = power.resample('h').mean()                  # 15 минут → час
+    if 'Nuclear' not in power:                          # после 2023 г. ряда может не быть совсем
+        power['Nuclear'] = 0
+    power = power[list(POWER_COLUMNS)].rename(columns=POWER_COLUMNS)
+    power['nuclear'] = power['nuclear'].fillna(0)       # АЭС закрыты 15.04.2023
     return power
 
 
 def clean_weather(weather):
-    """Погода по зоне: числовые признаки — среднее по 5 городам,
-    код погоды — максимальный (наиболее выраженное явление: осадки, снег)."""
-    return weather.groupby('time').agg(
-        temperature=('temperature_2m', 'mean'), wind_speed_100m=('wind_speed_100m', 'mean'),
-        radiation=('shortwave_radiation', 'mean'), cloud_cover=('cloud_cover', 'mean'),
-        weather_code=('weather_code', 'max'))
+    """Погода по зоне: среднее по 5 городам, код погоды — максимальный (самое выраженное явление)."""
+    zone = weather.drop(columns='city').groupby('time').mean()
+    zone['weather_code'] = weather.groupby('time')['weather_code'].max()
+    return zone
 
 
-# ---------- Текст: аннотирование ----------
+# ---------- Новости: очистка и разметка ----------
 
-RELEVANT = r'strom|energie|gas|preis|kraftwerk|netz|solar|wind'
-TOPICS = {  # тема — по первому совпавшему шаблону
-    'газ': r'gas',
-    'ВИЭ и отрицательные цены': r'negativ|solar|photovoltaik|wind|erneuerbar|ökostrom|überschuss',
-    'биржа': r'börse|großhandel|day-ahead|spotmarkt|terminmarkt|epex',
-    'регулирование': r'netzentgelt|umlage|steuer|regierung|gesetz|reform|bundesnetzagentur|habeck|reiche',
-    'тарифы для потребителей': r'tarif|anbieter|haushalt|verbraucher|kunden|rechnung|abschlag|vergleich',
+TOPICS = {  # тема → слова; тема выбирается по первому совпадению
+    'газ': ['gas'],
+    'ВИЭ и отрицательные цены': ['negativ', 'solar', 'photovoltaik', 'wind', 'erneuerbar', 'ökostrom'],
+    'биржа': ['börse', 'großhandel', 'day-ahead', 'spotmarkt', 'epex'],
+    'регулирование': ['netzentgelt', 'umlage', 'steuer', 'regierung', 'gesetz', 'reform', 'habeck'],
+    'тарифы для потребителей': ['tarif', 'anbieter', 'haushalt', 'verbraucher', 'kunden', 'rechnung'],
 }
-UP = r'steig|teurer|teuer|rekord|explo|anstieg|verdoppel|höher|hoch'   # рост цен
-DOWN = r'sink|günstig|billig|fällt|fallen|niedrig|negativ|entlast|sparen'  # снижение цен
+UP = ['steig', 'teuer', 'rekord', 'explo', 'anstieg', 'verdoppel', 'höher', 'hoch']     # рост цен
+DOWN = ['sink', 'günstig', 'billig', 'fällt', 'fallen', 'niedrig', 'negativ', 'sparen']  # снижение цен
+
+
+def topic_of(title):
+    for topic, words in TOPICS.items():
+        if any(word in title for word in words):
+            return topic
+    return 'прочее'
+
+
+def signal_of(title):
+    """+1 — заголовок о росте цен, −1 — о снижении, 0 — нейтральный."""
+    up = sum(word in title for word in UP)
+    down = sum(word in title for word in DOWN)
+    if up > down:
+        return 1
+    if down > up:
+        return -1
+    return 0
 
 
 def annotate_news(news):
     news = news.copy()
-    news['title'] = news['title'].str.rsplit(' - ', n=1).str[0].str.strip()  # « - Издание» в конце
-    news['time'] = pd.to_datetime(news['pubDate'], format='%a, %d %b %Y %H:%M:%S GMT', utc=True)
+    news['title'] = news['title'].str.rsplit(' - ', n=1).str[0]   # убираем « - Издание» в конце
     news = news.drop_duplicates(['title', 'source'])
-    text = news['title'].str.lower()
-    news = news[text.str.contains(RELEVANT)].copy()            # убираем нерелевантные заголовки
-    text = news['title'].str.lower()
-    news['topic'] = 'прочее'
-    for topic, pattern in reversed(TOPICS.items()):            # первый в словаре — главный
-        news.loc[text.str.contains(pattern), 'topic'] = topic
-    news['price_signal'] = (np.sign(text.str.count(UP) - text.str.count(DOWN))).astype(int)
-    news['date'] = news['time'].dt.tz_convert(TZ).dt.date
-    return news[['time', 'date', 'query', 'source', 'title', 'topic', 'price_signal', 'link']]
-
-
-def news_daily(news):
-    """Агрегат по дням: число публикаций, доли тем, средний ценовой сигнал."""
-    daily = news.groupby('date').agg(news_count=('title', 'size'), news_signal=('price_signal', 'mean'))
-    shares = pd.crosstab(news['date'], news['topic'], normalize='index')
-    shares.columns = ['news_share_' + c for c in shares.columns]
-    return daily.join(shares)
+    lower = news['title'].str.lower()
+    news = news[lower.str.contains('strom|energie|gas|preis')]    # только релевантные заголовки
+    news['topic'] = news['title'].str.lower().apply(topic_of)
+    news['price_signal'] = news['title'].str.lower().apply(signal_of)
+    time_utc = pd.to_datetime(news['pubDate'], format='%a, %d %b %Y %H:%M:%S GMT', utc=True)
+    news['date'] = time_utc.dt.tz_convert('Europe/Berlin').dt.strftime('%Y-%m-%d')
+    return news[['date', 'source', 'title', 'topic', 'price_signal', 'link']]
 
 
 # ---------- Слияние ----------
 
-def build_dataset(price, power, weather_zone, holidays, eurostat, news_by_day):
-    df = price.to_frame().join(power).join(weather_zone)   # left join: остаются часы, где есть цена
-    local = df.index.tz_convert(TZ)
+def build_dataset(price, power, weather, holidays, eurostat, news):
+    df = price.to_frame().join(power).join(weather)   # почасовые данные; остаются часы, где есть цена
 
-    # календарные признаки — по местному времени
-    df['date'] = local.date
+    local = df.index.tz_convert('Europe/Berlin')      # календарь — по местному времени
+    df['date'] = local.strftime('%Y-%m-%d')
     df['hour'] = local.hour
     df['dow'] = local.dayofweek
     df['month'] = local.month
     df['year'] = local.year
 
-    # праздники (день → все часы дня)
-    federal = set(holidays.loc[holidays['global'], 'date'].dt.date)
-    regional = holidays[~holidays['global']].groupby(holidays['date'].dt.date)['n_states'].sum()
+    # праздники: день → все часы дня
+    federal = holidays.loc[holidays['global'], 'date']
     df['is_holiday'] = df['date'].isin(federal)
-    df['holiday_states'] = np.where(df['is_holiday'], 16, df['date'].map(regional).fillna(0))
-    df['day_type'] = np.select([df['is_holiday'], df['dow'] >= 5], ['праздник', 'выходной'], 'рабочий')
+    df['day_type'] = 'рабочий'
+    df.loc[df['dow'] >= 5, 'day_type'] = 'выходной'
+    df.loc[df['is_holiday'], 'day_type'] = 'праздник'
 
-    # месячные данные Eurostat (месяц → все часы месяца)
-    month_key = pd.Series(local.strftime('%Y-%m'), index=df.index)
-    df['eu_res_share'] = month_key.map((eurostat['wind'] + eurostat['solar'] + eurostat['hydro']) / eurostat['total'])
-    df['eu_fossil_share'] = month_key.map(eurostat['fossil'] / eurostat['total'])
+    # Eurostat: месяц → все часы месяца
+    month = pd.Series(local.strftime('%Y-%m'), index=df.index)
+    df['eu_res_share'] = month.map((eurostat['wind'] + eurostat['solar'] + eurostat['hydro']) / eurostat['total'])
 
-    # новости (день → все часы дня); дни без публикаций — нули
-    df = df.join(news_by_day, on='date')
-    news_cols = list(news_by_day.columns)
-    df[news_cols] = df[news_cols].fillna(0)
+    # новости: день → все часы дня; дни без новостей — 0
+    daily = news.groupby('date').agg(news_count=('title', 'count'), news_signal=('price_signal', 'mean'))
+    df = df.join(daily, on='date')
+    df[['news_count', 'news_signal']] = df[['news_count', 'news_signal']].fillna(0)
 
-    # целевые признаки и режим рынка
+    # целевой признак: час из 25% самых дешёвых за сутки
     df['is_cheap_window'] = df['price'] <= df.groupby('date')['price'].transform('quantile', 0.25)
-    df['market_regime'] = pd.cut(df['year'], [2018, 2020, 2022, 2100],
-                                 labels=['до кризиса', 'кризис 2021–22', 'после кризиса'])
+
+    # режим рынка: уровень цен сильно отличался до, во время и после энергокризиса
+    df['market_regime'] = 'после кризиса'
+    df.loc[df['year'] <= 2022, 'market_regime'] = 'кризис 2021–22'
+    df.loc[df['year'] <= 2020, 'market_regime'] = 'до кризиса'
+
     df.index.name = 'time'
-    return df
+    return df.reset_index()
 
 
 # ---------- Хранение и обновление ----------
 
-def save(df, table, con, key):
-    """Записывает строки в таблицу; строки с теми же ключами заменяются (обновление периода)."""
-    df = df.reset_index() if df.index.name else df
-    for col in df.columns:
-        if isinstance(df[col].dtype, pd.DatetimeTZDtype):
-            df[col] = df[col].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-        elif pd.api.types.is_datetime64_any_dtype(df[col]):
-            df[col] = df[col].dt.strftime('%Y-%m-%d')
-        elif df[col].dtype == object or isinstance(df[col].dtype, pd.CategoricalDtype):
-            df[col] = df[col].astype(str)
-    exists = con.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone()
-    if exists:
-        keys = df[key].drop_duplicates().tolist()
-        con.executemany(f'DELETE FROM {table} WHERE {key} = ?', [(k,) for k in keys])
+def save(df, table, start, end):
+    """Записывает данные в таблицу; старые строки за этот же период удаляются,
+    поэтому повторный запуск не создаёт дублей."""
+    con = sqlite3.connect(DB)
+    if con.execute('SELECT 1 FROM sqlite_master WHERE name = ?', (table,)).fetchone():
+        con.execute(f'DELETE FROM {table} WHERE date BETWEEN ? AND ?', (start, end))
     df.to_sql(table, con, if_exists='append', index=False)
-    con.execute(f'CREATE INDEX IF NOT EXISTS idx_{table}_{key} ON {table}({key})')
+    con.commit()
+    con.close()
 
 
 def update(start, end):
-    """Полный цикл за период: загрузка → очистка → слияние → запись в data/energy.db."""
+    """Полный цикл за период: загрузка → очистка → слияние → запись в базу."""
     news = annotate_news(load_news(start, end))
-    holidays = load_holidays(start, end)
-    eurostat = load_eurostat(start, end)
-    dataset = build_dataset(clean_price(load_price(start, end)), clean_power(load_power(start, end)),
-                            clean_weather(load_weather(start, end)), holidays, eurostat, news_daily(news))
-    DB.parent.mkdir(exist_ok=True)
-    with sqlite3.connect(DB) as con:
-        save(dataset, 'hourly', con, key='time')
-        save(news, 'news', con, key='link')
-        save(holidays, 'holidays', con, key='date')
-        save(eurostat, 'eurostat_monthly', con, key='month')
+    dataset = build_dataset(clean_price(load_price(start, end)),
+                            clean_power(load_power(start, end)),
+                            clean_weather(load_weather(start, end)),
+                            load_holidays(start, end),
+                            load_eurostat(start, end),
+                            news)
+    save(dataset, 'hourly', start, end)
+    save(news, 'news', start, end)
     return dataset
 
 
 if __name__ == '__main__':
     start, end = sys.argv[1], sys.argv[2]
     data = update(start, end)
-    print(f'Обновлено {len(data)} часов за {start} – {end} в {DB}')
+    print(f'Записано {len(data)} часов за {start} – {end} в {DB}')
